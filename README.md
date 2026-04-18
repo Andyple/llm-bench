@@ -18,7 +18,7 @@ llm-bench/
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+uv sync
 streamlit run app.py
 ```
 
