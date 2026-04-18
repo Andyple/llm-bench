@@ -1,0 +1,132 @@
+name: Model Serving CI
+
+on:
+  push:
+    paths:
+      - "config/**.yaml"     # Trigger on config changes
+      - "**.py"
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: "Backend to benchmark"
+        required: true
+        default: "vllm"
+        type: choice
+        options: [vllm, ollama, llama.cpp]
+      model:
+        description: "Model name"
+        required: true
+        default: "qwen2.5-7b-instruct"
+      quant:
+        description: "Quantization tag"
+        required: false
+        default: "fp16"
+
+jobs:
+  benchmark:
+    name: Run inference benchmark
+    runs-on: self-hosted    # <-- targets your Strix Halo runner
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Wait for backend health
+        run: |
+          python - <<'EOF'
+          import sys, time
+          sys.path.insert(0, ".")
+          from backends import BACKEND_REGISTRY
+          backend_name = "${{ github.event.inputs.backend || 'vllm' }}"
+          BackendCls = BACKEND_REGISTRY[backend_name]
+          b = BackendCls(host="localhost", port=8000, model="dummy")
+          for i in range(30):
+              if b.health_check():
+                  print(f"Backend {backend_name} is ready.")
+                  sys.exit(0)
+              time.sleep(2)
+          print("Backend health check failed.")
+          sys.exit(1)
+          EOF
+
+      - name: Run benchmark
+        id: bench
+        run: |
+          python run_bench.py \
+            --backend "${{ github.event.inputs.backend || 'vllm' }}" \
+            --model "${{ github.event.inputs.model || 'qwen2.5-7b-instruct' }}" \
+            --quant "${{ github.event.inputs.quant || 'fp16' }}" \
+            --n 20 \
+            --max-tokens 256 \
+            --prompt medium \
+            --output-dir results/ci
+
+      - name: Regression check against baseline
+        run: |
+          if [ -f "results/baseline_summary.json" ]; then
+            python run_bench.py \
+              --backend "${{ github.event.inputs.backend || 'vllm' }}" \
+              --model "${{ github.event.inputs.model || 'qwen2.5-7b-instruct' }}" \
+              --quant "${{ github.event.inputs.quant || 'fp16' }}" \
+              --n 20 \
+              --baseline results/baseline_summary.json \
+              --tps-threshold 0.90 \
+              --latency-threshold 1.20
+          else
+            echo "No baseline found — skipping regression check. Promote current run as baseline."
+            cp results/ci/*_summary.json results/baseline_summary.json || true
+          fi
+
+      - name: Run concurrency sweep
+        run: |
+          python run_bench.py \
+            --backend "${{ github.event.inputs.backend || 'vllm' }}" \
+            --model "${{ github.event.inputs.model || 'qwen2.5-7b-instruct' }}" \
+            --quant "${{ github.event.inputs.quant || 'fp16' }}" \
+            --sweep \
+            --sweep-levels "1,4,16" \
+            --sweep-requests 10
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: results/ci/
+          retention-days: 30
+
+      - name: Post summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const files = fs.readdirSync('results/ci/').filter(f => f.endsWith('_summary.json'));
+            if (!files.length) return;
+            const summary = JSON.parse(fs.readFileSync(`results/ci/${files[0]}`));
+            const body = `## ⚡ Benchmark Results
+            | Metric | Value |
+            |--------|-------|
+            | Mean Output TPS | ${summary.mean_output_tps?.toFixed(1)} |
+            | TTFT p50 | ${(summary.ttft_p50 * 1000)?.toFixed(0)}ms |
+            | TTFT p95 | ${(summary.ttft_p95 * 1000)?.toFixed(0)}ms |
+            | Latency p95 | ${(summary.total_latency_p95 * 1000)?.toFixed(0)}ms |
+            | Peak Memory | ${(summary.peak_memory_mb / 1024)?.toFixed(2)}GB |
+            | Error Rate | ${(summary.error_rate * 100)?.toFixed(1)}% |
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

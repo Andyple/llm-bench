@@ -1,0 +1,32 @@
+backends:
+  vllm:
+    host: localhost
+    port: 8000
+  ollama:
+    host: localhost
+    port: 11434
+  llamacpp:
+    host: localhost
+    port: 8080
+
+defaults:
+  n_requests: 20
+  max_tokens: 256
+  temperature: 0.0
+  top_p: 1.0
+  concurrency_levels: [1, 4, 16]
+
+  # Prompt lengths to test (approximate tokens)
+  prompt_lengths:
+    short: "Explain what a transformer model is in one sentence."
+    medium: "You are a helpful assistant. The user asks: explain the difference between supervised and unsupervised learning, including examples of each and when you would use one over the other."
+    long: "You are an expert software engineer. Write a detailed explanation of how attention mechanisms work in transformer models, covering self-attention, multi-head attention, positional encodings, and how these components interact during both training and inference. Be thorough and technical."
+
+quant_tags:
+  - fp16
+  - q8_0
+  - q6_k
+  - q5_k_m
+  - q4_k_m
+  - q3_k_m
+  - q2_k
